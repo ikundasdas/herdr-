@@ -13,7 +13,7 @@
 
 id = "desktop-pet"
 name = "Desktop pet task notifier"
-version = "0.1.0"
+version = "0.1.1"
 description = "A desktop pixel pet that celebrates completed tasks and alerts when agents need confirmation."
 min_herdr_version = "0.9.0"
 platforms = ["windows"]

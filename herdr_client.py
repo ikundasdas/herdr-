@@ -38,20 +38,25 @@ CREATE_NO_WINDOW = 0x08000000
 
 
 def data_dirs():
-    """Return (config_dir, state_dir) for the plugin's files.
+    """Return (config_dir, state_dir) — one fixed directory, always the same.
 
-    herdr's hook environment may provide HERDR_PLUGIN_CONFIG_DIR and
-    HERDR_PLUGIN_STATE_DIR; use them when present. Without hook env (standalone
-    pet runs) fall back to %LOCALAPPDATA%\\herdr-desktop-pet. ensure_pet.py and
-    main.py must agree on these paths, so the logic lives in one place.
+    These used to honor herdr's hook environment (HERDR_PLUGIN_CONFIG_DIR /
+    HERDR_PLUGIN_STATE_DIR) and fall back to %LOCALAPPDATA%\\herdr-desktop-pet
+    for standalone runs. That silently split the pet's state in two: a pet
+    launched by a herdr hook read the hook directory, a hand-launched pet read
+    the fallback, and editing either file had no effect on the other one. In
+    practice the pet changed size on its own whenever a hook restarted it after
+    a manual run (config.json said scale=m54 in one file, native in the other).
+
+    One fixed path for every launcher is the only arrangement that cannot
+    surprise, so the hook environment is deliberately ignored. ensure_pet.py
+    and main.py must agree on these paths, so the logic lives in one place.
     """
-    fallback = os.path.join(
+    base = os.path.join(
         os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
         "herdr-desktop-pet",
     )
-    config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or fallback
-    state_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR") or fallback
-    return config_dir, state_dir
+    return base, base
 
 
 def herdr_base_dir():

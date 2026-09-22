@@ -38,15 +38,18 @@ herdr plugin log desktop-pet  # 查看钩子运行日志
 
 ## 配置
 
-`%LOCALAPPDATA%\herdr-desktop-pet\config.json`（不存在则用默认值；拖拽结束自动写回 position。
-若钩子环境提供 `HERDR_PLUGIN_CONFIG_DIR` / `HERDR_PLUGIN_STATE_DIR` 则优先使用它们）：
+`%LOCALAPPDATA%\herdr-desktop-pet\config.json`（不存在则用默认值；拖拽结束自动写回 position）：
+
+无论由 herdr 钩子拉起还是手动 `pythonw main.py`，配置和事件信箱 `inbox.jsonl` 都只用这一个目录。
+钩子环境里的 `HERDR_PLUGIN_CONFIG_DIR` / `HERDR_PLUGIN_STATE_DIR` 被**有意忽略**：以前按它们分流，
+会让同一只宠物读两份配置，手动启动时改好的尺寸会在钩子重启后悄悄变回去。
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `poll_ms` | `1500` | 轮询间隔（毫秒） |
 | `notify` | `["done","blocked","working"]` | 哪些状态迁移值得提示 |
 | `sound` | `true` | done/blocked 是否发声 |
-| `scale` | `"m72"` | 分辨率档：`native`(192x208) / `m96` / `m72` / `m54` |
+| `scale` | `"m72"` | 分辨率档：`native`(192x208) / `m96`(96x104) / `m72`(72x78) / `m54`(54x58)，改完重启宠物生效 |
 | `position` | `null` | 宠物窗口位置，拖拽后自动保存 |
 | `language` | `"zh"` | 界面文案语言 |
 
