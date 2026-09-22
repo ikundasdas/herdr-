@@ -149,6 +149,355 @@ def _resolve_scale(scale):
     return "m72"
 
 
+def _pet_log(message):
+    """Best-effort renderer log. Never raises."""
+    try:
+        path = os.path.join(os.environ.get("TEMP") or ".", "herdr-desktop-pet.log")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("%s pet_render: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+    except Exception:
+        pass
+
+
+def _process_table():
+    """{pid: (ppid, exe-lower)} via one Toolhelp snapshot (no console flash)."""
+    try:
+        import ctypes
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.c_ulong),
+                ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", ctypes.c_ulong),
+                ("cntThreads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == ctypes.c_void_p(-1).value:
+            return {}
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            table = {}
+            if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+                while True:
+                    table[int(entry.th32ProcessID)] = (
+                        int(entry.th32ParentProcessID),
+                        str(entry.szExeFile).lower(),
+                    )
+                    if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                        break
+            return table
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception:
+        return {}
+
+
+def _herdr_pids():
+    """PIDs of running herdr.exe processes via Toolhelp snapshot (no console flash)."""
+    try:
+        return [pid for pid, (_ppid, exe) in _process_table().items()
+                if exe in ("herdr.exe", "herdr")]
+    except Exception:
+        return []
+
+
+def _herdr_window_handles():
+    """Visible top-level HWNDs for herdr, ordered best-first.
+
+    herdr is a TUI: it owns no window, it lives inside a terminal. Finding
+    that terminal is the whole problem.
+
+    A process-tree walk alone is NOT enough on this machine: Windows Terminal
+    hosts the shell through ConPTY, so the shell running herdr is not a child
+    of WindowsTerminal.exe and the tree link is missing entirely. herdr's own
+    terminal-title convention is the reliable link instead -- herdr retitles
+    the terminal to "<machine>: <workspace>" (observed here:
+    "LAPTOP-DR3RL2UQ: wmcs-bj").
+
+    Candidates are scored, best first:
+      1000       own    - window owned by a herdr.exe process itself.
+       500       titled - title carries herdr's "<machine>: <workspace>"
+                          convention, or a plain "herdr".
+      100-dist  hosted - the window process has herdr.exe in its DESCENDANT
+                          subtree, closest host first. Shell processes are
+                          excluded: explorer.exe launched the terminal, so its
+                          subtree always contains herdr and every Explorer
+                          window (desktop, taskbar, folders) would match. The
+                          old code also accepted the PARENT's subtree, which
+                          is why the pet foregrounded random 1x1 helper
+                          windows such as ThumbnailDeviceHelperWnd.
+        50       terminal - last resort: the window belongs to a terminal
+                          emulator. Only reachable while herdr.exe is alive,
+                          so focusing a terminal beats spawning a duplicate
+                          when the title signal is momentarily blank (herdr
+                          rewrites the title on every workspace switch).
+
+    Windows too small to be a terminal are dropped outright, and EnumWindows
+    yields topmost-first so equal scores keep Z-order. Every hit is logged
+    (tier/score/title/host-exe) for troubleshooting.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+        table = _process_table()
+        herdr_pids = {pid for pid, (_ppid, exe) in table.items()
+                      if exe in ("herdr.exe", "herdr")}
+        if not herdr_pids:
+            _pet_log("focus herdr: no herdr process in the snapshot (procs=%d)"
+                     % len(table))
+            return []
+        children = {}
+        for pid, (ppid, _exe) in table.items():
+            children.setdefault(ppid, []).append(pid)
+
+        def down_distance(root):
+            """Hops down from `root` to the nearest herdr.exe (0 = itself)."""
+            if root <= 0 or root not in table:
+                return None
+            if root in herdr_pids:
+                return 0
+            seen, frontier, hops = {root}, [root], 0
+            while frontier:
+                hops += 1
+                nxt = []
+                for cur in frontier:
+                    for child in children.get(cur, ()):
+                        if child in seen:
+                            continue
+                        if child in herdr_pids:
+                            return hops
+                        seen.add(child)
+                        nxt.append(child)
+                frontier = nxt
+            return None
+
+        machine = (os.environ.get("COMPUTERNAME")
+                   or os.environ.get("HOSTNAME") or "").strip().lower()
+        me = os.getpid()
+        MIN_W, MIN_H = 120, 80
+        SHELLS = ("explorer.exe",)
+        TERMINALS = ("windowsterminal.exe", "wt.exe", "conhost.exe",
+                     "openconsole.exe", "mintty.exe", "wezterm-gui.exe",
+                     "wezterm.exe", "alacritty.exe", "tabby.exe",
+                     "fluentterminal.exe", "hyper.exe")
+        hits = []          # (score, hwnd, tier, title, host exe, distance)
+        seen = [0, 0, 0]   # [visible top-level, passed size filter, minimized]
+        diag = []          # "WxH@x,y/exe" per visible window, logged only on a miss
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_uint), ("flags", ctypes.c_uint),
+                        ("showCmd", ctypes.c_uint), ("ptMinPosition", POINT),
+                        ("ptMaxPosition", POINT),
+                        ("rcNormalPosition", ctypes.wintypes.RECT)]
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                seen[0] += 1
+                pid = ctypes.c_ulong()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                pid = int(pid.value)
+                rect = ctypes.wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    diag.append("rectfail/%s" % table.get(pid, (0, "?"))[1])
+                    return True
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+                iconic = bool(user32.IsIconic(hwnd))
+                if iconic:
+                    # A minimized window reports its ICON rect (measured here:
+                    # 237x39 at -32000,-32000), never its real geometry, so the
+                    # size filter below would discard a minimized herdr terminal
+                    # and every double-click would silently do nothing while
+                    # herdr.exe is alive ("herdr is running but no window
+                    # matched"). Judge it by the geometry it restores to
+                    # instead; _foreground_hwnd() un-minimizes it right after.
+                    place = WINDOWPLACEMENT()
+                    place.length = ctypes.sizeof(WINDOWPLACEMENT)
+                    if user32.GetWindowPlacement(hwnd, ctypes.byref(place)):
+                        normal = place.rcNormalPosition
+                        width = normal.right - normal.left
+                        height = normal.bottom - normal.top
+                    seen[2] += 1
+                diag.append("%dx%d@%d,%d%s/%s"
+                            % (width, height, rect.left, rect.top,
+                               " minimized" if iconic else "",
+                               table.get(pid, (0, "?"))[1]))
+                if pid == me:
+                    return True               # never target our own pet window
+                if width < MIN_W or height < MIN_H:
+                    return True               # helper/tool windows are not panels
+                seen[1] += 1
+                length = user32.GetWindowTextLengthW(hwnd)
+                title = ""
+                if 0 < length < 512:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    title = buf.value
+                lower = title.lower()
+                _ppid, exe = table.get(pid, (0, "?"))
+                distance = down_distance(pid)
+                score, tier = 0, ""
+                if distance == 0:
+                    score, tier = 1000, "own"
+                elif "herdr" in lower or (machine and lower.startswith(machine)):
+                    score, tier = 500, "titled"
+                elif distance is not None and exe not in SHELLS:
+                    score, tier = 100 - min(distance, 90), "hosted"
+                elif exe in TERMINALS:
+                    score, tier = 50, "terminal"
+                if score:
+                    hits.append((score, int(hwnd), tier, title, exe, distance))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        hits.sort(key=lambda hit: -hit[0])     # stable: ties keep Z-order
+        for score, hwnd, tier, title, exe, distance in hits:
+            _pet_log("focus herdr: hit tier=%s score=%s dist=%s title=%r host=%s hwnd=%s"
+                     % (tier, score, distance, title, exe, hwnd))
+        if not hits:
+            _pet_log("focus herdr: no candidate window (procs=%d herdr_pids=%d "
+                     "visible=%d sized=%d minimized=%d) [%s]"
+                     % (len(table), len(herdr_pids), seen[0], seen[1], seen[2],
+                        " ".join(diag[:24])))
+        return [hwnd for _s, hwnd, _t, _ti, _e, _d in hits]
+    except Exception as error:
+        _pet_log("focus herdr: window lookup failed: %r" % (error,))
+        return []
+
+
+def _foreground_hwnd(hwnd):
+    """Restore (if minimized) + bring HWND to the foreground. Returns bool."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        try:
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+        except Exception:
+            pass
+        if user32.SetForegroundWindow(hwnd):
+            return True
+        # Foreground lock: fall back to top-most ordering + active status.
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetActiveWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            return user32.GetForegroundWindow() == hwnd
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _launch_herdr():
+    """Open the herdr main panel in a visible window and return True if started.
+
+    herdr is a terminal (TUI) app: bare `herdr` attaches to the persistent
+    session, so it needs a console to live in. Prefer Windows Terminal
+    (`wt new-tab --title herdr herdr`, tab title doubles as our focus hook);
+    fall back to `cmd /c start "herdr" herdr` (fresh console window).
+
+    The pet itself is spawned by herdr hooks, so it inherits HERDR_* /
+    HERDRDR_* variables. A child herdr started with those set aborts with
+    "nested herdr is disabled", so strip every HERDR-prefixed key first.
+    """
+    try:
+        import shutil
+        import subprocess
+        exe = shutil.which("herdr.exe") or shutil.which("herdr")
+        if not exe:
+            return False
+        env = {k: v for k, v in os.environ.items()
+               if not k.upper().startswith("HERDR")}
+        NO_WINDOW = 0x08000000
+        wt = shutil.which("wt.exe") or shutil.which("wt")
+        try:
+            if wt:
+                subprocess.Popen([wt, "new-tab", "--title", "herdr", exe],
+                                 stdin=None, stdout=None, stderr=None,
+                                 env=env)
+            else:
+                subprocess.Popen(["cmd.exe", "/c", "start", '"herdr"', exe],
+                                 stdin=None, stdout=None, stderr=None,
+                                 creationflags=NO_WINDOW, env=env)
+            return True
+        except Exception:
+            pass
+        # Last resort: direct spawn (no visible panel, but at least running).
+        try:
+            DETACHED = 0x00000008
+            NEW_GROUP = 0x00000200
+            subprocess.Popen([exe], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=DETACHED | NEW_GROUP | NO_WINDOW,
+                             env=env)
+            return True
+        except Exception:
+            return False
+    except Exception as error:
+        _pet_log("launch herdr failed: %r" % (error,))
+        return False
+
+
+def _focus_herdr_window(timeout=6.0):
+    """Windows-only: bring the herdr main window to the front.
+
+    An already-running herdr always wins. If herdr.exe is alive it is sitting
+    in some terminal, so a failed lookup must NOT spawn a second client -- that
+    is precisely the "double-click opened a new herdr" bug. Launch only when no
+    herdr process exists at all.
+    """
+    try:
+        if os.name != "nt":
+            return False
+        for hwnd in _herdr_window_handles():
+            if _foreground_hwnd(hwnd):
+                _pet_log("focus herdr: foregrounded hwnd=%s" % hwnd)
+                return True
+        if _herdr_pids():
+            # herdr is running; its window just did not match. Refuse to spawn
+            # a duplicate and say so in the log instead.
+            _pet_log("focus herdr: herdr is running but no window matched; "
+                     "not launching a duplicate")
+            return False
+        # Not running: launch, then poll for its window.
+        _launch_herdr()
+        end = time.time() + float(timeout)
+        while time.time() < end:
+            time.sleep(0.4)
+            for hwnd in _herdr_window_handles():
+                if _foreground_hwnd(hwnd):
+                    _pet_log("focus herdr: foregrounded hwnd=%s" % hwnd)
+                    return True
+        _pet_log("focus herdr: no window appeared within %.0fs" % float(timeout))
+        return False
+    except Exception as error:
+        _pet_log("focus herdr failed: %r" % (error,))
+        return False
+
+
 class PetApp:
     """All visual truth of the desktop pet. main.py only talks to this API."""
 
@@ -172,6 +521,7 @@ class PetApp:
         self.reminders_paused = False           # internal; main.py unaware
         self._drag_cb = None
         self._activate_cb = None
+        self._suppress_drag_until = 0.0   # double-click guard: ignore drag right after
         self._shown = False
         self._entry_pending = False
 
@@ -575,7 +925,7 @@ class PetApp:
         self.cv.bind("<ButtonPress-1>", self._drag_press)
         self.cv.bind("<B1-Motion>", self._drag_motion)
         self.cv.bind("<ButtonRelease-1>", self._drag_release)
-        self.cv.bind("<Double-Button-1>", lambda e: self._activate())
+        self.cv.bind("<Double-Button-1>", self._on_double_click)
         self.cv.bind("<Button-3>", self._show_menu)
         self.cv.bind("<Enter>", lambda e: self._show_panel())
         self.cv.bind("<Leave>", lambda e: self._hide_panel())
@@ -594,6 +944,8 @@ class PetApp:
     def _drag_motion(self, e):
         if not hasattr(self, "_drag"):
             return
+        if time.time() < getattr(self, "_suppress_drag_until", 0.0):
+            return                                # second press of a double-click: hold still
         px, py, ox, oy, moved = self._drag
         dx, dy = e.x_root - px, e.y_root - py
         moved = max(moved, abs(dx), abs(dy))
@@ -607,10 +959,31 @@ class PetApp:
     def _drag_release(self, e):
         if not hasattr(self, "_drag"):
             return
+        if time.time() < getattr(self, "_suppress_drag_until", 0.0):
+            del self._drag                        # double-click: drop, don't save position
+            return
         moved = self._drag[4]
         del self._drag
         if moved > 3 and self._drag_cb:
             self._drag_cb(self.root.winfo_x(), self.root.winfo_y())
+
+    def _on_double_click(self, e=None):
+        """Double-click sprite: cancel any drag, keep pane-focus, pop herdr up front."""
+        try:
+            if hasattr(self, "_drag"):
+                del self._drag
+            self._suppress_drag_until = time.time() + 0.35
+        except Exception:
+            pass
+        self._activate()                          # existing pane-focus callback (main.py)
+        self._focus_herdr()                       # new: herdr main window to foreground
+
+    def _focus_herdr(self):
+        """Bring the herdr main window forward without ever blocking the tk loop."""
+        try:
+            threading.Thread(target=_focus_herdr_window, daemon=True).start()
+        except Exception as error:
+            _pet_log("focus herdr thread failed: %r" % (error,))
 
     def _activate(self):
         if self._activate_cb:

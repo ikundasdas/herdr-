@@ -2,7 +2,8 @@
 
 一只常驻桌面的像素宠物（糖宝皮肤），轮询 herdr 的 socket API，监视各 agent 任务的状态变化。
 任务**完成**时庆祝（眨眼小拳头 + 提示音），**思考中**时流口水，**等确认**时瞪眼报警，
-**开始干活**时轻提示。点击宠物跳转到最近通知的任务，拖拽记住位置。
+**开始干活**时轻提示。单击宠物跳转到最近通知的任务，**双击把 herdr 窗口拉到前台**
+（最小化了会自动还原；herdr 没在跑就启动它，绝不重复开），拖拽记住位置。
 
 ## 从市场安装
 
@@ -29,7 +30,7 @@ herdr plugin log desktop-pet  # 查看钩子运行日志
 | `ensure_pet.py` | 一次性引导：写一行事件到 inbox、确保宠物进程唯一在跑（命名互斥体），没跑就拉起 `pythonw main.py` |
 | `herdr_client.py` | herdr socket 客户端（命名管道 + 会话快照兜底） |
 | `main.py` | 宠物大脑：轮询、状态机、气泡/提示音调度、离线策略 |
-| `pet_render.py` | tkinter 渲染器：72 帧预载、状态徽章、拖拽、右键菜单 |
+| `pet_render.py` | tkinter 渲染器：72 帧预载、状态徽章、拖拽、右键菜单、双击聚焦 herdr |
 | `pet_render_headless.py` | 控制台版渲染器（契约一致，用于无 GUI 自测） |
 | `dsh_watcher.py` / `dsh_ctl.py` | DSH 会话监视 + DSH Web 一键启停 |
 | `assets/frames/` + `assets/frames_meta.json` | 皮肤：四档分辨率（native/m96/m72/m54）各 72 帧 + 帧契约 |
