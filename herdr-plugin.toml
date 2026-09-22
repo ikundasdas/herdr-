@@ -1,0 +1,30 @@
+# Local herdr plugin: a desktop pixel pet that reacts to agent task states.
+#
+# The pet itself is one long-lived GUI process (main.py) that polls herdr's
+# socket API and owns a single-instance mutex. Hooks here only run
+# ensure_pet.py, a one-shot bootstrap that appends the event to an inbox file
+# (so a live pet reacts within ~250ms instead of waiting for its next poll)
+# and starts the pet when it is not running. The startup hook covers herdr
+# restarts, so the pet comes back without needing an event first.
+#
+# Windows note: a console-subsystem hook command flashes a terminal window on
+# every event (same pitfall zh-state-labels documents), so the hooks run
+# pythonw.exe instead of python.exe - GUI subsystem, no window ever appears.
+
+id = "desktop-pet"
+name = "Desktop pet task notifier"
+version = "0.1.0"
+description = "A desktop pixel pet that celebrates completed tasks and alerts when agents need confirmation."
+min_herdr_version = "0.9.0"
+platforms = ["windows"]
+
+[[startup]]
+command = ["pythonw", "ensure_pet.py"]
+
+[[events]]
+on = "pane.created"
+command = ["pythonw", "ensure_pet.py"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["pythonw", "ensure_pet.py"]
